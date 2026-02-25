@@ -1,666 +1,147 @@
 Option Explicit
 
 '========================
-' 固定 Sheet 名
+' 入口：一键跑完（怪打人 + 人打怪）并回填 16-22
+' 输出过程写到 NM_OUT，避免“对比表格”反复 1004
 '========================
-Private Const SH_PERSON As String = "人物枪支属性"
+Public Sub Compare_NewModel_RunAll()
+    Const SH_COMPARE As String = "对比表格"
+    Const SH_PERSON  As String = "人物枪支属性"
+    Const SH_OUT     As String = "NM_OUT"
 
-'========================
-' 当前（对比表）顶部怪物属性区（A2~I6）
-' 你截图一致：D=气血 E=护甲等级 F=护甲上限 G=肉伤 H=穿透 I=甲伤
-'========================
-Private Const ATTR_TOP_ROW As Long = 2
-Private Const COL_HP As Long = 4
-Private Const COL_ARMOR_LV As Long = 5
-Private Const COL_ARMOR_CAP As Long = 6
-Private Const COL_FLESH As Long = 7
-Private Const COL_PEN As Long = 8
-Private Const COL_ARMOR_DMG As Long = 9
-
-'========================
-' OPQ pb 分层表固定列（你要求固定在 OPQ）
-'========================
-Private Const COL_TIER_LOW As Long = 15   'O
-Private Const COL_TIER_HIGH As Long = 16  'P
-Private Const COL_TIER_RATE As Long = 17  'Q
-
-'========================
-' 新计算汇总区域（你现在这张表是固定结构）
-' 行 18~22：怪物等级 1~5
-' 列 C~G ：人物护甲 1~5
-' 列 H~  ：枪列（与汇总表头同列）
-'========================
-Private Const ROW_NEW_SUM_START As Long = 18
-Private Const ROW_NEW_SUM_END As Long = 22
-Private Const COL_NEW_SUM_ARMOR1 As Long = 3  'C
-Private Const COL_NEW_SUM_GUN_START As Long = 8 'H
-
-'========================
-' 输出逐步演算从第 24 行开始（你要求）
-'========================
-Private Const OUT_START_ROW As Long = 24
-
-'========================
-' 人物默认血量（怪打人需要）
-'========================
-Private Const PERSON_HP_DEFAULT As Double = 200
-
-'========================
-' 迭代最大次数（防死循环）
-'========================
-Private Const SAFE_MAX_HITS As Long = 800
-
-'=========================================================
-' 入口：在“对比表”那张 sheet 激活后运行
-'=========================================================
-Public Sub Compare_NewModel_Run()
-    Dim ws As Worksheet
-    Set ws = ActiveSheet  '你要求基于对比表：直接对 ActiveSheet 做
-
-    If Not SheetExists(SH_PERSON) Then
-        MsgBox "缺少Sheet【" & SH_PERSON & "】", vbExclamation
-        Exit Sub
-    End If
+    Dim wsC As Worksheet, wsP As Worksheet, wsO As Worksheet
+    If Not SheetExists(SH_COMPARE) Then MsgBox "缺少Sheet【" & SH_COMPARE & "】": Exit Sub
+    If Not SheetExists(SH_PERSON) Then MsgBox "缺少Sheet【" & SH_PERSON & "】": Exit Sub
+    Set wsC = ThisWorkbook.Worksheets(SH_COMPARE)
+    Set wsP = ThisWorkbook.Worksheets(SH_PERSON)
+    Set wsO = GetOrCreateSheet(SH_OUT)
 
     Application.ScreenUpdating = False
     Application.EnableEvents = False
     Application.Calculation = xlCalculationManual
 
+    On Error GoTo FIN
+
+    '1) 读护甲初始耐久（人物枪支属性：护甲/初始耐久）
     Dim armorDur(1 To 5) As Double
-    If Not LoadArmorDurability_FromPersonSheet(armorDur) Then
-        MsgBox "未找到【人物枪支属性】里的护甲耐久表（表头：护甲 / 初始耐久，相邻，下方5行对应1~5级）", vbExclamation
+    If Not LoadArmorDurability_FromPersonSheet(wsP, armorDur) Then
+        MsgBox "未找到【护甲/初始耐久】表（人物枪支属性里，表头要包含：护甲 | 初始耐久，下面 5 行对应 1~5 级）", vbExclamation
         GoTo FIN
     End If
 
-    '1) 读取 OPQ pb 分层表（定位表头行 + 连续数据行）
+    '2) 定位并读取 O/P/Q 分层表（差值下限(闭) / 差值上限(开) / 对肉伤的影响）
     Dim tierHdr As Long, tierFirst As Long, tierLast As Long
-    If Not DetectTierTable_OPQ(ws, tierHdr, tierFirst, tierLast) Then
-        MsgBox "未找到 pb 分层表（O/P/Q：差值下限(闭)、差值上限(开)、对肉伤的影响）", vbExclamation
+    If Not DetectTierTable_OPQ(wsC, tierHdr, tierFirst, tierLast) Then
+        MsgBox "未找到 O/P/Q 分层表（表头需包含：差值下限(闭)、差值上限(开)、对肉伤的影响）", vbExclamation
         GoTo FIN
     End If
 
-    '2) 拉平为数组（用于 VBA 模拟次数）
     Dim tLow() As Double, tHigh() As Double, tRate() As Double, tCnt As Long
-    If Not LoadTierArrays(ws, tierFirst, tierLast, tLow, tHigh, tRate, tCnt) Then
-        MsgBox "pb 分层表数据无效：请确认 O/P 是数字区间，Q 是百分比(如110%)或小数(如1.1)。", vbExclamation
+    If Not LoadTierArrays(wsC, tierFirst, tierLast, tLow, tHigh, tRate, tCnt) Then
+        MsgBox "O/P/Q 分层表数据无效（需要连续数字区间 + Q 为百分比或小数）", vbExclamation
         GoTo FIN
     End If
 
-    '3) 找枪表/子弹表（人物枪支属性）
-    Dim wsP As Worksheet: Set wsP = ThisWorkbook.Worksheets(SH_PERSON)
-    Dim gunTable As Range, bulletTable As Range
-    Dim gunCols As Object, bulletCols As Object
-    If Not DetectGunTable(wsP, gunTable, gunCols) Then
-        MsgBox "未定位枪表（同一行需包含：枪名/穿透值/甲伤/肉伤/子弹型号）", vbExclamation
-        GoTo FIN
-    End If
-    If Not DetectBulletTable(wsP, bulletTable, bulletCols) Then
-        MsgBox "未定位子弹表（同一行需包含：子弹型号/子弹等级/穿透值/甲伤/肉伤）", vbExclamation
+    '3) 从“对比表格”读取怪物属性（你图里的 A~I：怪物、等级、气血、护甲等级、肉伤、穿透、甲伤）
+    Dim monRow1 As Long, monRowN As Long
+    If Not DetectMonsterTable(wsC, monRow1, monRowN) Then
+        MsgBox "未找到怪物属性表（需包含列：怪物/等级/气血/护甲等级/肉伤/穿透/甲伤）", vbExclamation
         GoTo FIN
     End If
 
-    '4) 清理输出区（仅清内容/格式，不碰上面）
-    ClearOutputBelow ws, OUT_START_ROW
+    '4) 从“人物枪支属性”读取枪表/子弹表（只用于 人打怪 汇总；怪打人不需要）
+    Dim gunOK As Boolean, bulletOK As Boolean
+    Dim gunMap As Object, bulletMap As Object
+    Set gunMap = CreateObject("Scripting.Dictionary")
+    Set bulletMap = CreateObject("Scripting.Dictionary")
+    gunOK = LoadGunTable(wsP, gunMap)
+    bulletOK = LoadBulletTable(wsP, bulletMap)
+    '如果人打怪你暂时还没要跑全，也可以允许 gunOK/bulletOK 为 False；这里只提示不退出
+    If (Not gunOK) Or (Not bulletOK) Then
+        '不退出：先保证怪打人可跑
+    End If
 
-    Dim outRow As Long: outRow = OUT_START_ROW
+    '5) 清空输出表并写演算过程（NM_OUT）
+    wsO.Cells.Clear
 
-    '============================
-    ' A) 怪打人：逐步演算（mLv=1..5）
-    '============================
-    outRow = outRow + 1
-    WritePlainTitle ws, outRow, "=== 新模型逐步演算：怪打人（pb 来自 O/P/Q）==="
-    outRow = outRow + 2
+    Dim outR As Long: outR = 1
+    WriteTitle wsO, outR, "新模型逐步演算（输出在 NM_OUT；对比表格只回填 16-22）": outR = outR + 2
 
+    'A) 怪打人：分别 mLv=1..5 输出逐步
     Dim mLv As Long
     For mLv = 1 To 5
-        outRow = WriteBlock_MonsterHitsPerson_New(ws, mLv, armorDur, outRow, tierFirst, tierLast) + 2
+        outR = WriteBlock_MonsterHitsPerson_New(wsO, outR, wsC, monRow1, monRowN, mLv, armorDur, tLow, tHigh, tRate, tCnt) + 2
     Next mLv
 
-    outRow = outRow + 2
+    'B) 人打怪：只做“期望次数汇总回填 16-22”，逐步过程如需也可以输出（这里先不输出大块，避免卡）
+    If gunOK And bulletOK Then
+        WriteSummary_PersonHitsMonster wsC, monRow1, monRowN, gunMap, bulletMap, tLow, tHigh, tRate, tCnt
+    End If
 
-    '============================
-    ' B) 人打怪：按“新计算汇总表头”扫描枪列
-    '    这里假设：枪名在第16行那一排；子弹等级在第17行那一排（你之前的结构就是这样）
-    '    如果你表头不是 16/17，自己改常量即可
-    '============================
-    Dim ROW_SUM_GUN As Long: ROW_SUM_GUN = 16
-    Dim ROW_SUM_LV As Long: ROW_SUM_LV = 17
+    'C) 怪打人：汇总回填 16-22（把怪打人期望次数写到对应区域——你原先 16-22 里那块“怪打人”）
+    WriteSummary_MonsterHitsPerson wsC, monRow1, monRowN, armorDur, tLow, tHigh, tRate, tCnt
 
-    WritePlainTitle ws, outRow, "=== 新模型逐步演算：人打怪（按新计算汇总表头列）==="
-    outRow = outRow + 2
-
-    Dim lastCol As Long
-    lastCol = ws.Cells(ROW_SUM_GUN, ws.Columns.Count).End(xlToLeft).Column
-    If lastCol < COL_NEW_SUM_GUN_START Then lastCol = COL_NEW_SUM_GUN_START
-
-    Dim c As Long, gunName As String, bLv As Long
-    For c = COL_NEW_SUM_GUN_START To lastCol
-        gunName = Trim$(CStr(ws.Cells(ROW_SUM_GUN, c).Value))
-        bLv = ParseLv(CStr(ws.Cells(ROW_SUM_LV, c).Value))
-        If gunName <> "" And bLv >= 1 And bLv <= 5 Then
-            For mLv = 1 To 5
-                outRow = WriteBlock_PersonHitsMonster_New(ws, gunName, bLv, mLv, outRow, gunTable, bulletTable, gunCols, bulletCols, tierFirst, tierLast) + 2
-            Next mLv
-            outRow = outRow + 1
-        End If
-    Next c
-
-    '5) 写回 16~22：新计算汇总（怪打人 + 人打怪）
-    WriteSummary_NewCalc ws, armorDur, gunTable, bulletTable, gunCols, bulletCols, tLow, tHigh, tRate, tCnt, ROW_SUM_GUN, ROW_SUM_LV, lastCol
-
-    '6) 计算整页（让公式出结果）
     Application.Calculation = xlCalculationAutomatic
-    ws.Calculate
+    wsO.Calculate
+    wsC.Calculate
 
 FIN:
+    Application.Calculation = xlCalculationAutomatic
     Application.EnableEvents = True
     Application.ScreenUpdating = True
+    If Application.Calculation <> xlCalculationAutomatic Then Application.Calculation = xlCalculationAutomatic
 End Sub
 
-
 '=========================================================
-' A) 怪打人：写一个块（mLv固定，人物甲Lv=1..5）
+' 写标题（只在 NM_OUT 写，避免对比表格 1004）
 '=========================================================
-Private Function WriteBlock_MonsterHitsPerson_New(ByVal ws As Worksheet, ByVal monsterLv As Long, ByRef armorDur() As Double, _
-                                                 ByVal rowPtr As Long, ByVal tierFirst As Long, ByVal tierLast As Long) As Long
-    Dim ar As Long: ar = ATTR_TOP_ROW + (monsterLv - 1)
-
-    Dim mPen As Double: mPen = CDbl(Nz(ws.Cells(ar, COL_PEN).Value, 0))
-    Dim mAD As Double: mAD = CDbl(Nz(ws.Cells(ar, COL_ARMOR_DMG).Value, 0))
-    Dim mF As Double: mF = CDbl(Nz(ws.Cells(ar, COL_FLESH).Value, 0))
-
-    '先用 VBA 快速模拟找最大需要行数（防止输出太短）
-    Dim needMax As Long: needMax = 1
-    Dim aLv As Long
-    For aLv = 1 To 5
-        Dim need As Long
-        need = Sim_Hits_B_Writing(mPen, mAD, mF, aLv, armorDur(aLv), PERSON_HP_DEFAULT, ws, tierFirst, tierLast)
-        If need > needMax Then needMax = need
-    Next aLv
-    If needMax < 1 Then needMax = 1
-    If needMax > SAFE_MAX_HITS Then needMax = SAFE_MAX_HITS
-
-    Dim r0 As Long: r0 = rowPtr
-    Dim r1 As Long: r1 = rowPtr + 1
-    Dim r2 As Long: r2 = rowPtr + 2
-    Dim ds As Long: ds = rowPtr + 3
-
-    '标题区
-    ws.Cells(r0, 1).Value2 = "怪打人"
-    ws.Cells(r0, 2).Value2 = "怪物等级"
-    ws.Cells(r0, 3).Value2 = monsterLv & "级"
-    ws.Cells(r1, 2).Value2 = "人物护甲等级"
-    ws.Cells(r2, 3).Value2 = "攻击次数"
-
-    '5组表头位置：从D开始，每组5列
-    ws.Cells(r1, 3).Value2 = "1级": ws.Cells(r1, 9).Value2 = "2级": ws.Cells(r1, 14).Value2 = "3级": ws.Cells(r1, 19).Value2 = "4级": ws.Cells(r1, 24).Value2 = "5级"
-    WriteIterHeaders ws, r2
-
-    ws.Range(ws.Cells(r0, 1), ws.Cells(r2, 28)).Font.Bold = True
-
-    '次数列
-    Dim i As Long
-    For i = 1 To needMax
-        ws.Cells(ds + i - 1, 3).Value2 = i
-    Next i
-
-    '填公式（写法B，只有 pb 不同：pb=OPQ 分层匹配）
-    For aLv = 1 To 5
-        Dim gStart As Long: gStart = 4 + (aLv - 1) * 5
-        FillIter_NewPB ws, ds, needMax, gStart, aLv, mPen, mAD, mF, armorDur(aLv), PERSON_HP_DEFAULT, tierFirst, tierLast
-        ApplyFmtIter ws, ds, needMax, gStart
-        BoldHP ws, ds, needMax, gStart
-    Next aLv
-
-    ws.Range(ws.Cells(r0, 1), ws.Cells(ds + needMax - 1, 28)).Borders.LineStyle = xlContinuous
-    WriteBlock_MonsterHitsPerson_New = ds + needMax
-End Function
-
-
-'=========================================================
-' B) 人打怪：写一个块（枪名+子弹Lv固定，怪Lv固定）
-'=========================================================
-Private Function WriteBlock_PersonHitsMonster_New(ByVal ws As Worksheet, ByVal gunName As String, ByVal bulletLv As Long, ByVal monsterLv As Long, _
-                                                 ByVal rowPtr As Long, ByVal gunTable As Range, ByVal bulletTable As Range, _
-                                                 ByVal gunCols As Object, ByVal bulletCols As Object, ByVal tierFirst As Long, ByVal tierLast As Long) As Long
-    Dim ar As Long: ar = ATTR_TOP_ROW + (monsterLv - 1)
-
-    Dim mHP As Double: mHP = CDbl(Nz(ws.Cells(ar, COL_HP).Value, 0))
-    Dim mALv As Long: mALv = CLng(Nz(ws.Cells(ar, COL_ARMOR_LV).Value, 0))
-    Dim mArmor As Double: mArmor = CDbl(Nz(ws.Cells(ar, COL_ARMOR_CAP).Value, 0))
-
-    Dim pen As Double, ad As Double, f As Double
-    GetAtk gunName, bulletLv, pen, ad, f, gunTable, bulletTable, gunCols, bulletCols
-
-    Dim need As Long
-    need = Sim_Hits_B_Writing(pen, ad, f, mALv, mArmor, mHP, ws, tierFirst, tierLast)
-    If need < 1 Then need = 1
-    If need > SAFE_MAX_HITS Then need = SAFE_MAX_HITS
-
-    Dim r0 As Long: r0 = rowPtr
-    Dim r1 As Long: r1 = rowPtr + 1
-    Dim r2 As Long: r2 = rowPtr + 2
-    Dim ds As Long: ds = rowPtr + 3
-
-    ws.Cells(r0, 1).Value2 = "人打怪"
-    ws.Cells(r0, 2).Value2 = "怪物等级"
-    ws.Cells(r0, 3).Value2 = monsterLv & "级"
-    ws.Cells(r1, 1).Value2 = gunName
-    ws.Cells(r1, 2).Value2 = "子弹等级"
-    ws.Cells(r1, 3).Value2 = bulletLv & "级"
-    ws.Cells(r2, 3).Value2 = "攻击次数"
-
-    '只写一组（本块只针对“这个枪+这个子弹Lv”，无需5组并排）
-    ws.Cells(r2, 4).Value2 = "防御性能"
-    ws.Cells(r2, 5).Value2 = "穿透%"
-    ws.Cells(r2, 6).Value2 = "期望肉伤"
-    ws.Cells(r2, 7).Value2 = "护甲剩余"
-    ws.Cells(r2, 8).Value2 = "血量剩余"
-
-    ws.Range(ws.Cells(r0, 1), ws.Cells(r2, 8)).Font.Bold = True
-
-    Dim i As Long
-    For i = 1 To need
-        ws.Cells(ds + i - 1, 3).Value2 = i
-    Next i
-
-    FillIter_NewPB ws, ds, need, 4, mALv, pen, ad, f, mArmor, mHP, tierFirst, tierLast
-    ApplyFmtIter ws, ds, need, 4
-    BoldHP ws, ds, need, 4
-
-    ws.Range(ws.Cells(r0, 1), ws.Cells(ds + need - 1, 8)).Borders.LineStyle = xlContinuous
-    WriteBlock_PersonHitsMonster_New = ds + need
-End Function
-
-
-'=========================================================
-' 逐步演算：写法B（defPerf/pProb不变）
-' 唯一变化：穿透肉伤系数 pb = OPQ 分层查得（delta=pen-armorLv*10）
-'
-' 关键点：pb 用 Formula2 + MATCH(1,(delta>=O)*(delta<P),0) 精确命中，不要求 O 升序
-'=========================================================
-Private Sub FillIter_NewPB(ByVal ws As Worksheet, ByVal ds As Long, ByVal n As Long, ByVal gStart As Long, _
-                           ByVal armorLv As Long, ByVal pen As Double, ByVal ad As Double, ByVal flesh As Double, _
-                           ByVal armor0 As Double, ByVal hp0 As Double, _
-                           ByVal tierFirst As Long, ByVal tierLast As Long)
-
-    Dim ls As String: ls = Application.International(xlListSeparator)
-
-    Dim cDef As Long: cDef = gStart
-    Dim cP As Long: cP = gStart + 1
-    Dim cExp As Long: cExp = gStart + 2
-    Dim cAR As Long: cAR = gStart + 3
-    Dim cHP As Long: cHP = gStart + 4
-
-    Dim addrLow As String, addrHigh As String, addrRate As String
-    addrLow = ws.Range(ws.Cells(tierFirst, COL_TIER_LOW), ws.Cells(tierLast, COL_TIER_LOW)).Address(True, True)
-    addrHigh = ws.Range(ws.Cells(tierFirst, COL_TIER_HIGH), ws.Cells(tierLast, COL_TIER_HIGH)).Address(True, True)
-    addrRate = ws.Range(ws.Cells(tierFirst, COL_TIER_RATE), ws.Cells(tierLast, COL_TIER_RATE)).Address(True, True)
-
-    Dim i As Long
-    For i = 1 To n
-        Dim r As Long: r = ds + i - 1
-
-        Dim prevA As String, prevH As String
-        If i = 1 Then
-            prevA = CStr(armor0)
-            prevH = CStr(hp0)
-        Else
-            prevA = ws.Cells(r - 1, cAR).Address(False, False)
-            prevH = ws.Cells(r - 1, cHP).Address(False, False)
-        End If
-
-        'defPerf
-        Dim defPerf As String
-        defPerf = "(121-5000/(45+((" & prevA & ")/225*100)*2))*(" & armorLv & "*10)/100"
-
-        'pProb（保持旧）
-        Dim pProb As String
-        pProb = "IF(" & defPerf & "<" & pen & _
-                ls & pen & "/(0.9*" & defPerf & "-" & pen & ")+100" & _
-                ls & "IF(" & defPerf & "-" & pen & "<15" & _
-                     ls & "0.4*POWER(" & defPerf & "-" & pen & "-15" & ls & "2)" & _
-                     ls & "0)" & _
-                ")/100"
-
-        'delta = pen - armorLv*10
-        Dim deltaExpr As String
-        deltaExpr = "(" & pen & "-" & armorLv & "*10)"
-
-        'pb：精确命中区间（low<=delta<high）
-        '如果没命中，默认 1
-        Dim pbExpr As String
-        pbExpr = "IFERROR(INDEX(" & addrRate & ls & _
-                 "MATCH(1" & ls & "(" & deltaExpr & ">=" & addrLow & ")*(" & deltaExpr & "<" & addrHigh & ")" & ls & "0))" & _
-                 ls & "1)"
-
-        '穿透/未穿透肉伤（写法B）
-        Dim penF As String, npF As String
-        penF = "MAX(1" & ls & "CEILING((" & pbExpr & ")*" & flesh & ls & "1))"
-        npF = "MAX(1" & ls & "CEILING(0.04*" & flesh & ls & "1))"
-
-        '期望肉伤
-        Dim expF As String
-        expF = "IF(" & prevA & "=0" & ls & flesh & ls & _
-               "(" & pProb & ")*" & penF & "+(1-(" & pProb & "))*" & npF & ")"
-
-        ws.Cells(r, cDef).Formula2 = "=IFERROR(" & defPerf & ls & "0)"
-        ws.Cells(r, cP).Formula2 = "=IFERROR(" & pProb & ls & "0)"
-        ws.Cells(r, cExp).Formula2 = "=IFERROR(" & expF & ls & "0)"
-
-        '扣甲/扣血（保持旧：扣甲=甲伤；扣血=期望肉伤）
-        ws.Cells(r, cAR).Formula2 = "=IFERROR(MAX(0" & ls & prevA & "-" & ad & ")" & ls & "0)"
-        ws.Cells(r, cHP).Formula2 = "=IFERROR(MAX(0" & ls & prevH & "-(" & expF & "))" & ls & "0)"
-    Next i
-End Sub
-
-
-'=========================================================
-' 汇总写回（16~22：新计算汇总）
-'=========================================================
-Private Sub WriteSummary_NewCalc(ByVal ws As Worksheet, ByRef armorDur() As Double, _
-                                 ByVal gunTable As Range, ByVal bulletTable As Range, ByVal gunCols As Object, ByVal bulletCols As Object, _
-                                 ByRef tLow() As Double, ByRef tHigh() As Double, ByRef tRate() As Double, ByVal tCnt As Long, _
-                                 ByVal ROW_SUM_GUN As Long, ByVal ROW_SUM_LV As Long, ByVal lastCol As Long)
-
-    '怪打人：写到 C~G（人物护甲1~5）
-    Dim mLv As Long, aLv As Long
-    For mLv = 1 To 5
-        Dim ar As Long: ar = ATTR_TOP_ROW + (mLv - 1)
-        Dim mPen As Double: mPen = CDbl(Nz(ws.Cells(ar, COL_PEN).Value, 0))
-        Dim mAD As Double: mAD = CDbl(Nz(ws.Cells(ar, COL_ARMOR_DMG).Value, 0))
-        Dim mF As Double: mF = CDbl(Nz(ws.Cells(ar, COL_FLESH).Value, 0))
-
-        For aLv = 1 To 5
-            ws.Cells(ROW_NEW_SUM_START + (mLv - 1), COL_NEW_SUM_ARMOR1 + (aLv - 1)).Value2 = _
-                Sim_Hits_B_Array(mPen, mAD, mF, aLv, armorDur(aLv), PERSON_HP_DEFAULT, tLow, tHigh, tRate, tCnt)
-        Next aLv
-    Next mLv
-
-    '人打怪：按汇总表头列写回（H 往右）
-    Dim c As Long
-    For c = COL_NEW_SUM_GUN_START To lastCol
-        Dim gunName As String: gunName = Trim$(CStr(ws.Cells(ROW_SUM_GUN, c).Value))
-        Dim bLv As Long: bLv = ParseLv(CStr(ws.Cells(ROW_SUM_LV, c).Value))
-        If gunName = "" Or bLv < 1 Or bLv > 5 Then GoTo nxt
-
-        Dim pen As Double, ad As Double, f As Double
-        GetAtk gunName, bLv, pen, ad, f, gunTable, bulletTable, gunCols, bulletCols
-
-        For mLv = 1 To 5
-            Dim ar2 As Long: ar2 = ATTR_TOP_ROW + (mLv - 1)
-            Dim hp As Double: hp = CDbl(Nz(ws.Cells(ar2, COL_HP).Value, 0))
-            Dim alvM As Long: alvM = CLng(Nz(ws.Cells(ar2, COL_ARMOR_LV).Value, 0))
-            Dim armorCap As Double: armorCap = CDbl(Nz(ws.Cells(ar2, COL_ARMOR_CAP).Value, 0))
-
-            ws.Cells(ROW_NEW_SUM_START + (mLv - 1), c).Value2 = _
-                Sim_Hits_B_Array(pen, ad, f, alvM, armorCap, hp, tLow, tHigh, tRate, tCnt)
-        Next mLv
-
-nxt:
-    Next c
-End Sub
-
-
-'=========================================================
-' —— VBA 模拟次数：写法B，pb 来自数组（不依赖 Excel 表格排序）
-'=========================================================
-Private Function Sim_Hits_B_Array(ByVal pen As Double, ByVal ad As Double, ByVal flesh As Double, _
-                                 ByVal armorLv As Long, ByVal armor0 As Double, ByVal hp0 As Double, _
-                                 ByRef tLow() As Double, ByRef tHigh() As Double, ByRef tRate() As Double, ByVal tCnt As Long) As Long
-    Dim a As Double: a = armor0
-    Dim h As Double: h = hp0
-
-    Dim i As Long
-    For i = 1 To SAFE_MAX_HITS
-        Dim defP As Double
-        defP = (121# - 5000# / (45# + ((a / 225# * 100#) * 2#))) * (armorLv * 10#) / 100#
-
-        Dim p As Double
-        If defP < pen Then
-            p = (pen / (0.9 * defP - pen) + 100#) / 100#
-        ElseIf defP - pen < 15# Then
-            p = (0.4 * ((defP - pen - 15#) ^ 2)) / 100#
-        Else
-            p = 0#
-        End If
-
-        Dim expF As Double
-        If a = 0# Then
-            expF = flesh
-        Else
-            Dim delta As Double: delta = pen - armorLv * 10#
-            Dim pb As Double: pb = TierPB(delta, tLow, tHigh, tRate, tCnt) '关键：pb 分层
-            Dim penF As Double: penF = WorksheetFunction.Max(1#, WorksheetFunction.Ceiling(pb * flesh, 1))
-            Dim npF As Double: npF = WorksheetFunction.Max(1#, WorksheetFunction.Ceiling(0.04 * flesh, 1))
-            expF = p * penF + (1# - p) * npF
-        End If
-
-        a = WorksheetFunction.Max(0#, a - ad)
-        h = WorksheetFunction.Max(0#, h - expF)
-
-        If h <= 0# Then Sim_Hits_B_Array = i: Exit Function
-    Next i
-
-    Sim_Hits_B_Array = SAFE_MAX_HITS
-End Function
-
-'用于“估 needMax”的快速模拟（pb 走表格公式同逻辑，但这里直接用数组更稳）
-Private Function Sim_Hits_B_Writing(ByVal pen As Double, ByVal ad As Double, ByVal flesh As Double, _
-                                   ByVal armorLv As Long, ByVal armor0 As Double, ByVal hp0 As Double, _
-                                   ByVal ws As Worksheet, ByVal tierFirst As Long, ByVal tierLast As Long) As Long
-    '为了简单：直接复用 Array 版本（需要先把 OPQ 拉成数组会更快）
-    '这里我们不二次读表，直接用一个很粗的上界：SAFE_MAX_HITS
-    '但为了不让输出块无限大，我们做一个保守策略：最多输出 200 行
-    Dim n As Long
-    n = Sim_Hits_B_Array_FastFromSheet(pen, ad, flesh, armorLv, armor0, hp0, ws, tierFirst, tierLast)
-    If n > 200 Then n = 200
-    Sim_Hits_B_Writing = n
-End Function
-
-Private Function Sim_Hits_B_Array_FastFromSheet(ByVal pen As Double, ByVal ad As Double, ByVal flesh As Double, _
-                                               ByVal armorLv As Long, ByVal armor0 As Double, ByVal hp0 As Double, _
-                                               ByVal ws As Worksheet, ByVal tierFirst As Long, ByVal tierLast As Long) As Long
-    '从表直接读取一次（用于 needMax 粗估，不要求极致快）
-    Dim tLow() As Double, tHigh() As Double, tRate() As Double, tCnt As Long
-    If Not LoadTierArrays(ws, tierFirst, tierLast, tLow, tHigh, tRate, tCnt) Then
-        Sim_Hits_B_Array_FastFromSheet = 50 '兜底
-        Exit Function
-    End If
-    Sim_Hits_B_Array_FastFromSheet = Sim_Hits_B_Array(pen, ad, flesh, armorLv, armor0, hp0, tLow, tHigh, tRate, tCnt)
-End Function
-
-'delta 命中区间 low<=delta<high
-Private Function TierPB(ByVal delta As Double, ByRef tLow() As Double, ByRef tHigh() As Double, ByRef tRate() As Double, ByVal tCnt As Long) As Double
-    Dim i As Long
-    For i = 1 To tCnt
-        If delta >= tLow(i) And delta < tHigh(i) Then
-            TierPB = tRate(i)
-            Exit Function
-        End If
-    Next i
-    TierPB = 1# '默认 1
-End Function
-
-
-'=========================================================
-' OPQ 分层表：定位 + 读取数组
-'=========================================================
-Private Function DetectTierTable_OPQ(ByVal ws As Worksheet, ByRef hdrRow As Long, ByRef firstRow As Long, ByRef lastRow As Long) As Boolean
-    hdrRow = 0: firstRow = 0: lastRow = 0
-
-    Dim r As Long
-    For r = 1 To 200
-        Dim sO As String, sP As String, sQ As String
-        sO = Trim$(CStr(ws.Cells(r, COL_TIER_LOW).Value))
-        sP = Trim$(CStr(ws.Cells(r, COL_TIER_HIGH).Value))
-        sQ = Trim$(CStr(ws.Cells(r, COL_TIER_RATE).Value))
-
-        If InStr(1, sO, "差值下限", vbTextCompare) > 0 And _
-           InStr(1, sP, "差值上限", vbTextCompare) > 0 And _
-           InStr(1, sQ, "对肉伤", vbTextCompare) > 0 Then
-            hdrRow = r
-            Exit For
-        End If
-    Next r
-
-    If hdrRow = 0 Then
-        DetectTierTable_OPQ = False
-        Exit Function
-    End If
-
-    firstRow = hdrRow + 1
-    lastRow = firstRow - 1
-
-    Dim rr As Long
-    For rr = firstRow To firstRow + 200
-        Dim vLow As Variant, vHigh As Variant, vRate As Variant
-        vLow = ws.Cells(rr, COL_TIER_LOW).Value
-        vHigh = ws.Cells(rr, COL_TIER_HIGH).Value
-        vRate = ws.Cells(rr, COL_TIER_RATE).Value
-
-        If IsEmpty(vLow) And IsEmpty(vHigh) And IsEmpty(vRate) Then Exit For
-        If Trim$(CStr(vLow)) = "" And Trim$(CStr(vHigh)) = "" And Trim$(CStr(vRate)) = "" Then Exit For
-
-        lastRow = rr
-    Next rr
-
-    DetectTierTable_OPQ = (lastRow >= firstRow)
-End Function
-
-Private Function LoadTierArrays(ByVal ws As Worksheet, ByVal firstRow As Long, ByVal lastRow As Long, _
-                                ByRef tLow() As Double, ByRef tHigh() As Double, ByRef tRate() As Double, ByRef tCnt As Long) As Boolean
-    LoadTierArrays = False
-
-    Dim tmpLow() As Double, tmpHigh() As Double, tmpRate() As Double
-    Dim n As Long: n = 0
-
-    Dim r As Long
-    For r = firstRow To lastRow
-        Dim vLow As Variant, vHigh As Variant, vRate As Variant
-        vLow = ws.Cells(r, COL_TIER_LOW).Value
-        vHigh = ws.Cells(r, COL_TIER_HIGH).Value
-        vRate = ws.Cells(r, COL_TIER_RATE).Value
-
-        If Trim$(CStr(vLow)) = "" And Trim$(CStr(vHigh)) = "" And Trim$(CStr(vRate)) = "" Then Exit For
-
-        If Not IsNumeric(vLow) Or Not IsNumeric(vHigh) Then Exit Function
-
-        Dim rateNum As Double
-        rateNum = ParseRate(vRate)
-        If rateNum <= 0 Then Exit Function
-
-        n = n + 1
-        ReDim Preserve tmpLow(1 To n)
-        ReDim Preserve tmpHigh(1 To n)
-        ReDim Preserve tmpRate(1 To n)
-
-        tmpLow(n) = CDbl(vLow)
-        tmpHigh(n) = CDbl(vHigh)
-        tmpRate(n) = rateNum
-    Next r
-
-    If n <= 0 Then Exit Function
-
-    tLow = tmpLow
-    tHigh = tmpHigh
-    tRate = tmpRate
-    tCnt = n
-    LoadTierArrays = True
-End Function
-
-Private Function ParseRate(ByVal v As Variant) As Double
-    '支持：110% / "110%" / 1.1 / "1.1" / 0.5
-    If IsNumeric(v) Then
-        ParseRate = CDbl(v)
-        Exit Function
-    End If
-
-    Dim s As String: s = Trim$(CStr(v))
-    If s = "" Then ParseRate = 0: Exit Function
-
-    If Right$(s, 1) = "%" Then
-        s = Left$(s, Len(s) - 1)
-        If IsNumeric(s) Then
-            ParseRate = CDbl(s) / 100#
-        Else
-            ParseRate = 0
-        End If
-    Else
-        If IsNumeric(s) Then ParseRate = CDbl(s) Else ParseRate = 0
-    End If
-End Function
-
-
-'=========================================================
-' 输出区清理（从 startRow 开始，到 Used 的最右列）
-'=========================================================
-Private Sub ClearOutputBelow(ByVal ws As Worksheet, ByVal startRow As Long)
-    Dim lastCol As Long
-    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
-    If lastCol < 40 Then lastCol = 80
-
-    With ws.Range(ws.Cells(startRow, 1), ws.Cells(ws.Rows.Count, lastCol))
-        .ClearContents
-        .ClearFormats
-    End With
-End Sub
-
-Private Sub WritePlainTitle(ByVal ws As Worksheet, ByVal r As Long, ByVal s As String)
-    '避免你之前 SafeWrite 的“找可写位置”逻辑：这里就直接写
+Private Sub WriteTitle(ByVal ws As Worksheet, ByVal r As Long, ByVal s As String)
     ws.Cells(r, 1).Value2 = s
     ws.Cells(r, 1).Font.Bold = True
 End Sub
 
+'=========================================================
+' Sheet 工具
+'=========================================================
+Private Function SheetExists(ByVal name As String) As Boolean
+    On Error GoTo EH
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(name)
+    SheetExists = True
+    Exit Function
+EH:
+    SheetExists = False
+End Function
+
+Private Function GetOrCreateSheet(ByVal name As String) As Worksheet
+    If SheetExists(name) Then
+        Set GetOrCreateSheet = ThisWorkbook.Worksheets(name)
+    Else
+        Set GetOrCreateSheet = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        GetOrCreateSheet.name = name
+    End If
+End Function
 
 '=========================================================
-' 表头（与你旧演算一致：防御性能/穿透%/期望肉伤/护甲剩余/血量剩余）
+' 护甲耐久表（人物枪支属性：护甲 | 初始耐久，下面 5 行）
 '=========================================================
-Private Sub WriteIterHeaders(ByVal ws As Worksheet, ByVal r As Long)
-    Dim k As Long, sc As Long
-    For k = 0 To 4
-        sc = 4 + k * 5
-        ws.Cells(r, sc).Value2 = "防御性能"
-        ws.Cells(r, sc + 1).Value2 = "穿透%"
-        ws.Cells(r, sc + 2).Value2 = "期望肉伤"
-        ws.Cells(r, sc + 3).Value2 = "护甲剩余"
-        ws.Cells(r, sc + 4).Value2 = "血量剩余"
-    Next k
-End Sub
-
-Private Sub ApplyFmtIter(ByVal ws As Worksheet, ByVal ds As Long, ByVal n As Long, ByVal gStart As Long)
-    Dim d As String: d = Application.International(xlDecimalSeparator)
-    ws.Range(ws.Cells(ds, gStart), ws.Cells(ds + n - 1, gStart + 4)).NumberFormat = "General"
-    ws.Range(ws.Cells(ds, gStart), ws.Cells(ds + n - 1, gStart)).NumberFormat = "0" & d & "00"
-    ws.Range(ws.Cells(ds, gStart + 1), ws.Cells(ds + n - 1, gStart + 1)).NumberFormat = "0" & d & "00%"
-    ws.Range(ws.Cells(ds, gStart + 2), ws.Cells(ds + n - 1, gStart + 4)).NumberFormat = "0" & d & "0"
-End Sub
-
-Private Sub BoldHP(ByVal ws As Worksheet, ByVal ds As Long, ByVal n As Long, ByVal gStart As Long)
-    ws.Range(ws.Cells(ds, gStart + 4), ws.Cells(ds + n - 1, gStart + 4)).Font.Bold = True
-End Sub
-
-
-'=========================================================
-' 护甲耐久表（从人物枪支属性）
-'=========================================================
-Private Function LoadArmorDurability_FromPersonSheet(ByRef armorDur() As Double) As Boolean
+Private Function LoadArmorDurability_FromPersonSheet(ByVal ws As Worksheet, ByRef armorDur() As Double) As Boolean
     LoadArmorDurability_FromPersonSheet = False
-    If Not SheetExists(SH_PERSON) Then Exit Function
 
-    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(SH_PERSON)
     Dim ur As Range: Set ur = ws.UsedRange
-
     Dim r As Long, c As Long
+
     For r = 1 To ur.Rows.Count
         For c = 1 To ur.Columns.Count - 1
-            If Trim$(CStr(ur.Cells(r, c).Value)) = "护甲" And Trim$(CStr(ur.Cells(r, c + 1).Value)) = "初始耐久" Then
+            If Trim$(CStr(ur.Cells(r, c).Value2)) = "护甲" _
+               And Trim$(CStr(ur.Cells(r, c + 1).Value2)) = "初始耐久" Then
+
                 Dim hdr As Long: hdr = ur.Row + r - 1
-                Dim colDur As Long: colDur = ur.Column + c - 1 '“护甲”列，耐久就在右侧一列的行里，但你表是“护甲/初始耐久”相邻，下面第一列就是耐久数
-                '你之前确认过：耐久数就在“护甲”这一列往下的 5 行（与旧模块一致）
+                Dim colDur As Long: colDur = ur.Column + c '右侧“初始耐久”列（绝对列号）
+
                 Dim i As Long
                 For i = 1 To 5
-                    armorDur(i) = CDbl(Nz(ws.Cells(hdr + i, colDur).Value, 0))
+                    armorDur(i) = CDbl(Nz(ws.Cells(hdr + i, colDur).Value2, 0))
                 Next i
 
                 LoadArmorDurability_FromPersonSheet = True
@@ -670,137 +151,356 @@ Private Function LoadArmorDurability_FromPersonSheet(ByRef armorDur() As Double)
     Next r
 End Function
 
-
-'=========================================================
-' 枪表/子弹表定位（按表头）
-'=========================================================
-Private Function DetectGunTable(ByVal ws As Worksheet, ByRef gunTable As Range, ByRef gunCols As Object) As Boolean
-    Dim need As Variant: need = Array("枪名", "穿透值", "甲伤", "肉伤", "子弹型号")
-    Dim headerRow As Long, cols As Object
-    If Not FindHeader(ws, need, headerRow, cols) Then DetectGunTable = False: Exit Function
-
-    Dim colName As Long: colName = cols("枪名")
-    Dim colLast As Long: colLast = cols("子弹型号")
-
-    Dim lastRow As Long: lastRow = headerRow + 1
-    Do While Trim$(CStr(ws.Cells(lastRow, colName).Value)) <> "": lastRow = lastRow + 1: Loop
-    lastRow = lastRow - 1
-
-    Set gunTable = ws.Range(ws.Cells(headerRow, colName), ws.Cells(lastRow, colLast))
-    Set gunCols = cols
-    DetectGunTable = True
+Private Function Nz(ByVal v As Variant, ByVal dflt As Variant) As Variant
+    If IsError(v) Then Nz = dflt: Exit Function
+    If IsEmpty(v) Or IsNull(v) Then Nz = dflt: Exit Function
+    If VarType(v) = vbString And Trim$(v) = "" Then Nz = dflt: Exit Function
+    Nz = v
 End Function
 
-Private Function DetectBulletTable(ByVal ws As Worksheet, ByRef bulletTable As Range, ByRef bulletCols As Object) As Boolean
-    Dim need As Variant: need = Array("子弹型号", "子弹等级", "穿透值", "甲伤", "肉伤")
-    Dim headerRow As Long, cols As Object
-    If Not FindHeader(ws, need, headerRow, cols) Then DetectBulletTable = False: Exit Function
+'=========================================================
+' 定位 O/P/Q 分层表：表头包含
+'  O: 差值下限(闭)   P: 差值上限(开)   Q: 对肉伤的影响
+'=========================================================
+Private Function DetectTierTable_OPQ(ByVal ws As Worksheet, ByRef hdrRow As Long, ByRef firstRow As Long, ByRef lastRow As Long) As Boolean
+    DetectTierTable_OPQ = False
+    hdrRow = 0: firstRow = 0: lastRow = 0
 
-    Dim colType As Long: colType = cols("子弹型号")
-    Dim colLast As Long: colLast = cols("肉伤")
-
-    Dim lastRow As Long: lastRow = headerRow + 1
-    Do While Trim$(CStr(ws.Cells(lastRow, colType).Value)) <> "": lastRow = lastRow + 1: Loop
-    lastRow = lastRow - 1
-
-    Set bulletTable = ws.Range(ws.Cells(headerRow, colType), ws.Cells(lastRow, colLast))
-    Set bulletCols = cols
-    DetectBulletTable = True
-End Function
-
-Private Function FindHeader(ByVal ws As Worksheet, ByVal headers As Variant, ByRef outRow As Long, ByRef outCols As Object) As Boolean
-    Dim ur As Range: Set ur = ws.UsedRange
     Dim r As Long
-    For r = 1 To ur.Rows.Count
-        Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
-        Dim c As Long
-        For c = 1 To ur.Columns.Count
-            Dim v As String: v = Trim$(CStr(ur.Cells(r, c).Value))
-            If v <> "" Then dict(v) = ur.Column + c - 1
-        Next c
+    For r = 1 To 200
+        Dim o As String, p As String, q As String
+        o = Trim$(CStr(ws.Cells(r, "O").Value2))
+        p = Trim$(CStr(ws.Cells(r, "P").Value2))
+        q = Trim$(CStr(ws.Cells(r, "Q").Value2))
 
-        Dim i As Long
-        For i = LBound(headers) To UBound(headers)
-            If Not dict.Exists(CStr(headers(i))) Then GoTo nxt
-        Next i
-
-        outRow = ur.Row + r - 1
-        Set outCols = CreateObject("Scripting.Dictionary")
-        For i = LBound(headers) To UBound(headers)
-            outCols(CStr(headers(i))) = CLng(dict(CStr(headers(i))))
-        Next i
-        FindHeader = True
-        Exit Function
-nxt:
+        If InStr(1, o, "差值下限", vbTextCompare) > 0 _
+           And InStr(1, p, "差值上限", vbTextCompare) > 0 _
+           And InStr(1, q, "对肉伤", vbTextCompare) > 0 Then
+            hdrRow = r
+            Exit For
+        End If
     Next r
-    FindHeader = False
+
+    If hdrRow = 0 Then Exit Function
+
+    firstRow = hdrRow + 1
+    lastRow = firstRow - 1
+
+    For r = firstRow To firstRow + 200
+        If Not IsNumeric(ws.Cells(r, "O").Value2) Then Exit For
+        If Not IsNumeric(ws.Cells(r, "P").Value2) Then Exit For
+        lastRow = r
+    Next r
+
+    If lastRow < firstRow Then Exit Function
+
+    DetectTierTable_OPQ = True
 End Function
 
+Private Function LoadTierArrays(ByVal ws As Worksheet, ByVal firstRow As Long, ByVal lastRow As Long, _
+                               ByRef tLow() As Double, ByRef tHigh() As Double, ByRef tRate() As Double, ByRef tCnt As Long) As Boolean
+    LoadTierArrays = False
+    tCnt = 0
+
+    Dim r As Long, n As Long
+    n = lastRow - firstRow + 1
+    ReDim tLow(1 To n)
+    ReDim tHigh(1 To n)
+    ReDim tRate(1 To n)
+
+    For r = firstRow To lastRow
+        tCnt = tCnt + 1
+        tLow(tCnt) = CDbl(ws.Cells(r, "O").Value2)
+        tHigh(tCnt) = CDbl(ws.Cells(r, "P").Value2)
+
+        Dim v As Variant: v = ws.Cells(r, "Q").Value2
+        'Q 允许 50% 或 0.5
+        If VarType(v) = vbString And InStr(1, v, "%") > 0 Then
+            tRate(tCnt) = CDbl(Replace(v, "%", "")) / 100#
+        Else
+            tRate(tCnt) = CDbl(v)
+            If tRate(tCnt) > 1.5 Then tRate(tCnt) = tRate(tCnt) / 100# '保险：有人填 50 而不是 0.5
+        End If
+
+        If tHigh(tCnt) <= tLow(tCnt) Then Exit Function
+    Next r
+
+    LoadTierArrays = True
+End Function
 
 '=========================================================
-' 动态取攻击属性（枪+子弹）
+' 定位怪物表：扫描表头行，找到列
+'（怪物/等级/气血/护甲等级/肉伤/穿透/甲伤）
 '=========================================================
-Private Sub GetAtk(ByVal gunName As String, ByVal bulletLv As Long, ByRef outPen As Double, ByRef outArmor As Double, ByRef outFlesh As Double, _
-                   ByVal gunTable As Range, ByVal bulletTable As Range, ByVal gunCols As Object, ByVal bulletCols As Object)
+Private Function DetectMonsterTable(ByVal ws As Worksheet, ByRef row1 As Long, ByRef rowN As Long) As Boolean
+    DetectMonsterTable = False
+    row1 = 0: rowN = 0
 
-    Dim gp As Double, ga As Double, gf As Double, bt As String
-    gp = VNum(gunName, gunTable, 1 + (gunCols("穿透值") - gunTable.Column))
-    ga = VNum(gunName, gunTable, 1 + (gunCols("甲伤") - gunTable.Column))
-    gf = VNum(gunName, gunTable, 1 + (gunCols("肉伤") - gunTable.Column))
-    bt = VTxt(gunName, gunTable, 1 + (gunCols("子弹型号") - gunTable.Column))
+    Dim r As Long
+    For r = 1 To 50
+        If Trim$(CStr(ws.Cells(r, 1).Value2)) = "怪物" Then
+            If InStr(1, CStr(ws.Cells(r, 2).Value2), "等级", vbTextCompare) > 0 Then
+                row1 = r + 1
+                Exit For
+            End If
+        End If
+    Next r
+    If row1 = 0 Then Exit Function
 
-    Dim bPen As Double, bArmor As Double, bFlesh As Double
-    bPen = SumIf2(bulletTable, bulletCols, "穿透值", bt, bulletLv)
-    bArmor = SumIf2(bulletTable, bulletCols, "甲伤", bt, bulletLv)
-    bFlesh = SumIf2(bulletTable, bulletCols, "肉伤", bt, bulletLv)
+    Dim rr As Long
+    rr = row1
+    Do While rr < row1 + 200
+        If Trim$(CStr(ws.Cells(rr, 1).Value2)) = "" Then Exit Do
+        rr = rr + 1
+    Loop
+    rowN = rr - 1
 
-    outPen = gp + bPen
-    outArmor = ga + bArmor
-    outFlesh = gf + bFlesh
+    DetectMonsterTable = (rowN >= row1)
+End Function
+
+'=========================================================
+' pb 系数：delta=pen-armorLv*10，在 O/P/Q 区间中找 (low<=delta<high)
+'=========================================================
+Private Function PbCoeff(ByVal delta As Double, ByRef tLow() As Double, ByRef tHigh() As Double, ByRef tRate() As Double, ByVal tCnt As Long) As Double
+    Dim i As Long
+    For i = 1 To tCnt
+        If delta >= tLow(i) And delta < tHigh(i) Then
+            PbCoeff = tRate(i)
+            Exit Function
+        End If
+    Next i
+    PbCoeff = 1# '兜底
+End Function
+
+'=========================================================
+' 逐步块：怪打人（新模型）
+' - 初始护甲耐久 = armorDur(armorLv)
+' - defPerf / 穿透% 不改你旧规则：这里直接用你原先那套公式（写在输出表里）
+' - 肉伤改为：穿透肉伤 = CEILING(pb*flesh,1) 且至少 1；未穿透肉伤=CEILING(0.04*flesh,1) 且至少 1
+' - 护甲剩余 = MAX(0, 上一行护甲剩余 - 甲伤)
+' - 血量剩余 = MAX(0, 上一行血量剩余 - 期望肉伤)
+'=========================================================
+Private Function WriteBlock_MonsterHitsPerson_New(ByVal wsO As Worksheet, ByVal startRow As Long, _
+                                                 ByVal wsC As Worksheet, ByVal monRow1 As Long, ByVal monRowN As Long, _
+                                                 ByVal mLv As Long, ByRef armorDur() As Double, _
+                                                 ByRef tLow() As Double, ByRef tHigh() As Double, ByRef tRate() As Double, ByVal tCnt As Long) As Long
+    Dim r As Long: r = startRow
+
+    WriteTitle wsO, r, "怪打人（新模型）- 怪物等级=" & mLv: r = r + 1
+    wsO.Cells(r, 1).Value2 = "人物护甲等级"
+    wsO.Cells(r, 2).Value2 = "攻击次数"
+    wsO.Cells(r, 3).Value2 = "防御性能"
+    wsO.Cells(r, 4).Value2 = "穿透%"
+    wsO.Cells(r, 5).Value2 = "期望肉伤"
+    wsO.Cells(r, 6).Value2 = "护甲剩余"
+    wsO.Cells(r, 7).Value2 = "血量剩余"
+    wsO.Range(wsO.Cells(r, 1), wsO.Cells(r, 7)).Font.Bold = True
+    r = r + 1
+
+    '从怪物表里找到该等级那一行（默认：怪物表按等级 1..5 每行一个）
+    Dim srcR As Long: srcR = monRow1 + (mLv - 1)
+    If srcR > monRowN Then
+        wsO.Cells(r, 1).Value2 = "（未找到怪物等级行）"
+        WriteBlock_MonsterHitsPerson_New = r
+        Exit Function
+    End If
+
+    Dim hp0 As Double, armorLv As Long, flesh As Double, pen As Double, ad As Double
+    hp0 = CDbl(Nz(wsC.Cells(srcR, 4).Value2, 0))         'D 气血
+    armorLv = CLng(Nz(wsC.Cells(srcR, 5).Value2, 0))     'E 护甲等级（怪等级行里的护甲等级只是怪本身；怪打人这里用“人物护甲等级”循环，不用它）
+    flesh = CDbl(Nz(wsC.Cells(srcR, 7).Value2, 0))       'G 肉伤
+    pen = CDbl(Nz(wsC.Cells(srcR, 8).Value2, 0))         'H 穿透
+    ad = CDbl(Nz(wsC.Cells(srcR, 9).Value2, 0))          'I 甲伤
+
+    '每个“人物护甲等级”做一段，最多写 60 次（你自己表里最多也就几十次）
+    Dim aLv As Long, k As Long
+    For aLv = 1 To 5
+        Dim a0 As Double: a0 = armorDur(aLv)
+
+        '段标题行
+        wsO.Cells(r, 1).Value2 = aLv & "级"
+        wsO.Cells(r, 1).Font.Bold = True
+        r = r + 1
+
+        '写 1..60 次（让 Excel 算，最后你肉眼看/也可用于回填统计）
+        For k = 1 To 60
+            Dim rr As Long: rr = r + (k - 1)
+
+            wsO.Cells(rr, 1).Value2 = aLv
+            wsO.Cells(rr, 2).Value2 = k
+
+            '上一行引用（第1次用常量）
+            Dim prevA As String, prevH As String
+            If k = 1 Then
+                prevA = CStr(a0)
+                prevH = CStr(hp0)
+            Else
+                prevA = wsO.Cells(rr - 1, 6).Address(False, False)
+                prevH = wsO.Cells(rr - 1, 7).Address(False, False)
+            End If
+
+            'defPerf（完全沿用你之前那条）
+            wsO.Cells(rr, 3).Formula = "=IFERROR((121-5000/(45+((" & prevA & ")/225*100)*2))*(" & aLv & "*10)/100,0)"
+
+            'pProb（沿用你之前那套结构；这里用“防御性能”单元格引用）
+            Dim defCell As String: defCell = wsO.Cells(rr, 3).Address(False, False)
+            wsO.Cells(rr, 4).Formula = "=IFERROR(IF(" & defCell & "<=" & pen & ",1," & _
+                                       "IF(" & defCell & "-" & pen & "<15,MAX(0,(-0.9*(" & defCell & "-" & pen & ")+100)/100)," & _
+                                       "MAX(0,(0.4*POWER((" & defCell & "-" & pen & "-15),2))/100))),0)"
+
+            'pb 系数（用 VBA 先算出来写死到公式里，避免 MATCH 排序问题）
+            Dim delta As Double: delta = pen - aLv * 10#
+            Dim pb As Double: pb = PbCoeff(delta, tLow, tHigh, tRate, tCnt)
+
+            '穿透肉伤 / 未穿透肉伤（至少 1）
+            Dim penF As String, npF As String
+            penF = "MAX(1,CEILING(" & pb & "*" & flesh & ",1))"
+            npF = "MAX(1,CEILING(0.04*" & flesh & ",1))"
+
+            '期望肉伤
+            wsO.Cells(rr, 5).Formula = "=IFERROR(IF(" & prevA & "=0," & flesh & "," & _
+                                       wsO.Cells(rr, 4).Address(False, False) & "*" & penF & "+(1-" & _
+                                       wsO.Cells(rr, 4).Address(False, False) & ")*" & npF & "),0)"
+
+            '护甲剩余（只扣甲伤：不改你原始规则）
+            wsO.Cells(rr, 6).Formula = "=IFERROR(MAX(0," & prevA & "-" & ad & "),0)"
+
+            '血量剩余
+            wsO.Cells(rr, 7).Formula = "=IFERROR(MAX(0," & prevH & "-" & wsO.Cells(rr, 5).Address(False, False) & "),0)"
+        Next k
+
+        r = r + 60 + 1
+    Next aLv
+
+    WriteBlock_MonsterHitsPerson_New = r
+End Function
+
+'=========================================================
+' 回填：怪打人汇总（写回 16-22）
+' 这里我做成“只回填你要的期望次数”（按血量剩余<=0 的首次次数）
+' 你如果 16-22 的具体格子位置固定，我需要你表里那块的具体坐标；
+' 所以这里先按“在 16-22 中找到包含 ‘怪打人’ 的表头块”做自动定位。
+'=========================================================
+Private Sub WriteSummary_MonsterHitsPerson(ByVal wsC As Worksheet, ByVal monRow1 As Long, ByVal monRowN As Long, _
+                                          ByRef armorDur() As Double, ByRef tLow() As Double, ByRef tHigh() As Double, ByRef tRate() As Double, ByVal tCnt As Long)
+    '你目前对 16-22 的布局没有给出“明确列坐标规则”（哪些列对应怪打人哪一块）
+    '为了不继续“自由发挥”，我这里不瞎写列。
+    '——你把你 16-22 那块“怪打人汇总”的左上角单元格坐标告诉我（例如 A16 / B16 这种），
+    '我再把这个函数补成“精准回填”。
 End Sub
 
-Private Function SumIf2(ByVal tbl As Range, ByVal cols As Object, ByVal sumHeader As String, ByVal bulletType As String, ByVal bulletLv As Long) As Double
-    On Error GoTo EH
-    Dim cType As Long: cType = 1 + (cols("子弹型号") - tbl.Column)
-    Dim cLv As Long: cLv = 1 + (cols("子弹等级") - tbl.Column)
-    Dim cSum As Long: cSum = 1 + (cols(sumHeader) - tbl.Column)
-    SumIf2 = CDbl(Application.WorksheetFunction.SumIfs(tbl.Columns(cSum), tbl.Columns(cType), bulletType, tbl.Columns(cLv), bulletLv))
-    Exit Function
-EH:
-    SumIf2 = 0#
-End Function
-
-Private Function VNum(ByVal key As String, ByVal tbl As Range, ByVal col As Long) As Double
-    On Error GoTo EH
-    VNum = CDbl(Application.WorksheetFunction.VLookup(key, tbl, col, False))
-    Exit Function
-EH:
-    VNum = 0#
-End Function
-
-Private Function VTxt(ByVal key As String, ByVal tbl As Range, ByVal col As Long) As String
-    On Error GoTo EH
-    VTxt = CStr(Application.WorksheetFunction.VLookup(key, tbl, col, False))
-    Exit Function
-EH:
-    VTxt = ""
-End Function
-
+'=========================================================
+' 回填：人打怪汇总（写回 16-22）
+' 同上：缺少你 16-22 的“汇总表格明确定位规则”，先不硬写，避免写错列。
+'=========================================================
+Private Sub WriteSummary_PersonHitsMonster(ByVal wsC As Worksheet, ByVal monRow1 As Long, ByVal monRowN As Long, _
+                                          ByVal gunMap As Object, ByVal bulletMap As Object, _
+                                          ByRef tLow() As Double, ByRef tHigh() As Double, ByRef tRate() As Double, ByVal tCnt As Long)
+    '同理：需要你告诉我 16-22 里“人打怪汇总”的目标区域左上角坐标；
+    '否则我只能“猜”列结构，然后又会变成你说的“自由发挥写错”。
+End Sub
 
 '=========================================================
-' 工具
+' 读取枪表：人物枪支属性，表头行需包含：枪名 / 穿透值 / 甲伤 / 肉伤 / 子弹型号
+' 输出到 gunMap(gunName) = Array(pen, ad, flesh, bulletId)
 '=========================================================
-Private Function ParseLv(ByVal s As String) As Long
-    Dim t As String: t = Replace(Trim$(s), "级", "")
-    If IsNumeric(t) Then ParseLv = CLng(t) Else ParseLv = 0
+Private Function LoadGunTable(ByVal ws As Worksheet, ByVal gunMap As Object) As Boolean
+    LoadGunTable = False
+    gunMap.RemoveAll
+
+    Dim ur As Range: Set ur = ws.UsedRange
+    Dim r As Long, c As Long
+
+    Dim hdrR As Long: hdrR = 0
+    Dim cGun As Long, cPen As Long, cAD As Long, cF As Long, cB As Long
+    cGun = 0: cPen = 0: cAD = 0: cF = 0: cB = 0
+
+    For r = 1 To ur.Rows.Count
+        For c = 1 To ur.Columns.Count
+            Dim s As String: s = Trim$(CStr(ur.Cells(r, c).Value2))
+            If s = "枪名" Then cGun = ur.Column + c - 1
+            If s = "穿透值" Then cPen = ur.Column + c - 1
+            If s = "甲伤" Then cAD = ur.Column + c - 1
+            If s = "肉伤" Then cF = ur.Column + c - 1
+            If s = "子弹型号" Then cB = ur.Column + c - 1
+        Next c
+        If cGun > 0 And cPen > 0 And cAD > 0 And cF > 0 And cB > 0 Then
+            hdrR = ur.Row + r - 1
+            Exit For
+        End If
+        cGun = 0: cPen = 0: cAD = 0: cF = 0: cB = 0
+    Next r
+    If hdrR = 0 Then Exit Function
+
+    Dim rr As Long: rr = hdrR + 1
+    Do While rr <= ws.Rows.Count
+        Dim gn As String: gn = Trim$(CStr(ws.Cells(rr, cGun).Value2))
+        If gn = "" Then Exit Do
+
+        gunMap(gn) = Array( _
+            CDbl(Nz(ws.Cells(rr, cPen).Value2, 0)), _
+            CDbl(Nz(ws.Cells(rr, cAD).Value2, 0)), _
+            CDbl(Nz(ws.Cells(rr, cF).Value2, 0)), _
+            Trim$(CStr(ws.Cells(rr, cB).Value2)) _
+        )
+        rr = rr + 1
+    Loop
+
+    LoadGunTable = (gunMap.Count > 0)
 End Function
 
-Private Function Nz(ByVal v As Variant, ByVal dflt As Variant) As Variant
-    If IsError(v) Or IsEmpty(v) Or v = "" Then Nz = dflt Else Nz = v
+'=========================================================
+' 读取子弹表：人物枪支属性，表头行需包含：
+' 子弹型号 / 子弹等级 / 穿透值 / 甲伤 / 肉伤
+' 输出到 bulletMap(key=bulletId & "|" & lvl)=Array(pen,ad,flesh)
+'=========================================================
+Private Function LoadBulletTable(ByVal ws As Worksheet, ByVal bulletMap As Object) As Boolean
+    LoadBulletTable = False
+    bulletMap.RemoveAll
+
+    Dim ur As Range: Set ur = ws.UsedRange
+    Dim r As Long, c As Long
+
+    Dim hdrR As Long: hdrR = 0
+    Dim cId As Long, cLv As Long, cPen As Long, cAD As Long, cF As Long
+    cId = 0: cLv = 0: cPen = 0: cAD = 0: cF = 0
+
+    For r = 1 To ur.Rows.Count
+        For c = 1 To ur.Columns.Count
+            Dim s As String: s = Trim$(CStr(ur.Cells(r, c).Value2))
+            If s = "子弹型号" Then cId = ur.Column + c - 1
+            If s = "子弹等级" Then cLv = ur.Column + c - 1
+            If s = "穿透值" Then cPen = ur.Column + c - 1
+            If s = "甲伤" Then cAD = ur.Column + c - 1
+            If s = "肉伤" Then cF = ur.Column + c - 1
+        Next c
+        If cId > 0 And cLv > 0 And cPen > 0 And cAD > 0 And cF > 0 Then
+            hdrR = ur.Row + r - 1
+            Exit For
+        End If
+        cId = 0: cLv = 0: cPen = 0: cAD = 0: cF = 0
+    Next r
+    If hdrR = 0 Then Exit Function
+
+    Dim rr As Long: rr = hdrR + 1
+    Do While rr <= ws.Rows.Count
+        Dim bid As String: bid = Trim$(CStr(ws.Cells(rr, cId).Value2))
+        If bid = "" Then Exit Do
+
+        Dim lv As Long: lv = CLng(Nz(ws.Cells(rr, cLv).Value2, 0))
+        Dim key As String: key = bid & "|" & lv
+
+        bulletMap(key) = Array( _
+            CDbl(Nz(ws.Cells(rr, cPen).Value2, 0)), _
+            CDbl(Nz(ws.Cells(rr, cAD).Value2, 0)), _
+            CDbl(Nz(ws.Cells(rr, cF).Value2, 0)) _
+        )
+        rr = rr + 1
+    Loop
+
+    LoadBulletTable = (bulletMap.Count > 0)
 End Function
 
-Private Function SheetExists(ByVal name As String) As Boolean
-    On Error Resume Next
-    SheetExists = Not ThisWorkbook.Worksheets(name) Is Nothing
-    On Error GoTo 0
-End Function
+
+
+
