@@ -123,10 +123,7 @@ Private Function GetOrCreateSheet(ByVal name As String) As Worksheet
 End Function
 
 '=========================================================
-' 逐步演算：写法B（defPerf/pProb不变）
-' 唯一变化：穿透肉伤系数 pb = OPQ 分层查得（delta=pen-armorLv*10）
-'
-' 关键点：pb 用兼容写法 + MATCH(1,(delta>=O)*(delta<P),0) 精确命中，不要求 O 升序
+' 护甲耐久表（人物枪支属性：护甲 | 初始耐久，下面 5 行）
 '=========================================================
 Private Function LoadArmorDurability_FromPersonSheet(ByVal ws As Worksheet, ByRef armorDur() As Double) As Boolean
     LoadArmorDurability_FromPersonSheet = False
@@ -147,49 +144,12 @@ Private Function LoadArmorDurability_FromPersonSheet(ByVal ws As Worksheet, ByRe
                     armorDur(i) = CDbl(Nz(ws.Cells(hdr + i, colDur).Value2, 0))
                 Next i
 
-        'defPerf
-        Dim defPerf As String
-        defPerf = "(121-5000/(45+((" & prevA & ")/225*100)*2))*(" & armorLv & "*10)/100"
-
-        'pProb（保持旧）
-        Dim pProb As String
-        pProb = "IF(" & defPerf & "<" & pen & _
-                ls & pen & "/(0.9*" & defPerf & "-" & pen & ")+100" & _
-                ls & "IF(" & defPerf & "-" & pen & "<15" & _
-                     ls & "0.4*POWER(" & defPerf & "-" & pen & "-15" & ls & "2)" & _
-                     ls & "0)" & _
-                ")/100"
-
-        'delta = pen - armorLv*10
-        Dim deltaExpr As String
-        deltaExpr = "(" & pen & "-" & armorLv & "*10)"
-
-        'pb：精确命中区间（low<=delta<high）
-        '如果没命中，默认 1
-        Dim pbExpr As String
-        pbExpr = "IFERROR(INDEX(" & addrRate & ls & _
-                 "MATCH(1" & ls & "(" & deltaExpr & ">=" & addrLow & ")*(" & deltaExpr & "<" & addrHigh & ")" & ls & "0))" & _
-                 ls & "1)"
-
-        '穿透/未穿透肉伤（写法B）
-        Dim penF As String, npF As String
-        penF = "MAX(1" & ls & "CEILING((" & pbExpr & ")*" & flesh & ls & "1))"
-        npF = "MAX(1" & ls & "CEILING(0.04*" & flesh & ls & "1))"
-
-        '期望肉伤
-        Dim expF As String
-        expF = "IF(" & prevA & "=0" & ls & flesh & ls & _
-               "(" & pProb & ")*" & penF & "+(1-(" & pProb & "))*" & npF & ")"
-
-        SetCellFormulaCompat ws.Cells(r, cDef), "=IFERROR(" & defPerf & ls & "0)"
-        SetCellFormulaCompat ws.Cells(r, cP), "=IFERROR(" & pProb & ls & "0)"
-        SetCellFormulaCompat ws.Cells(r, cExp), "=IFERROR(" & expF & ls & "0)"
-
-        '扣甲/扣血（保持旧：扣甲=甲伤；扣血=期望肉伤）
-        SetCellFormulaCompat ws.Cells(r, cAR), "=IFERROR(MAX(0" & ls & prevA & "-" & ad & ")" & ls & "0)"
-        SetCellFormulaCompat ws.Cells(r, cHP), "=IFERROR(MAX(0" & ls & prevH & "-(" & expF & "))" & ls & "0)"
-    Next i
-End Sub
+                LoadArmorDurability_FromPersonSheet = True
+                Exit Function
+            End If
+        Next c
+    Next r
+End Function
 
 Private Function Nz(ByVal v As Variant, ByVal dflt As Variant) As Variant
     If IsError(v) Then Nz = dflt: Exit Function
@@ -494,36 +454,12 @@ End Function
 ' 子弹型号 / 子弹等级 / 穿透值 / 甲伤 / 肉伤
 ' 输出到 bulletMap(key=bulletId & "|" & lvl)=Array(pen,ad,flesh)
 '=========================================================
-Private Function DetectGunTable(ByVal ws As Worksheet, ByRef gunTable As Range, ByRef gunCols As Object) As Boolean
-    Dim need As Variant: need = Array("枪名", "穿透值", "甲伤", "肉伤", "子弹型号")
-    Dim headerRow As Long, cols As Object
-    If Not FindHeader(ws, need, headerRow, cols) Then DetectGunTable = False: Exit Function
+Private Function LoadBulletTable(ByVal ws As Worksheet, ByVal bulletMap As Object) As Boolean
+    LoadBulletTable = False
+    bulletMap.RemoveAll
 
-    Dim colName As Long: colName = cols("枪名")
-    Dim colLast As Long: colLast = cols("子弹型号")
-
-    Dim lastRow As Long: lastRow = headerRow + 1
-    Do While lastRow <= ws.Rows.Count And Trim$(CStr(ws.Cells(lastRow, colName).Value)) <> "": lastRow = lastRow + 1: Loop
-    lastRow = lastRow - 1
-    If lastRow <= headerRow Then DetectGunTable = False: Exit Function
-
-    Set gunTable = ws.Range(ws.Cells(headerRow, colName), ws.Cells(lastRow, colLast))
-    Set gunCols = cols
-    DetectGunTable = True
-End Function
-
-Private Function DetectBulletTable(ByVal ws As Worksheet, ByRef bulletTable As Range, ByRef bulletCols As Object) As Boolean
-    Dim need As Variant: need = Array("子弹型号", "子弹等级", "穿透值", "甲伤", "肉伤")
-    Dim headerRow As Long, cols As Object
-    If Not FindHeader(ws, need, headerRow, cols) Then DetectBulletTable = False: Exit Function
-
-    Dim colType As Long: colType = cols("子弹型号")
-    Dim colLast As Long: colLast = cols("肉伤")
-
-    Dim lastRow As Long: lastRow = headerRow + 1
-    Do While lastRow <= ws.Rows.Count And Trim$(CStr(ws.Cells(lastRow, colType).Value)) <> "": lastRow = lastRow + 1: Loop
-    lastRow = lastRow - 1
-    If lastRow <= headerRow Then DetectBulletTable = False: Exit Function
+    Dim ur As Range: Set ur = ws.UsedRange
+    Dim r As Long, c As Long
 
     Dim hdrR As Long: hdrR = 0
     Dim cId As Long, cLv As Long, cPen As Long, cAD As Long, cF As Long
@@ -566,35 +502,5 @@ Private Function DetectBulletTable(ByVal ws As Worksheet, ByRef bulletTable As R
 End Function
 
 
-
-Private Sub SetCellFormulaCompat(ByVal tgt As Range, ByVal fx As String)
-    On Error GoTo TryFormula
-    tgt.Formula2 = fx
-    Exit Sub
-
-TryFormula:
-    Err.Clear
-    On Error GoTo TryFormulaArray
-    tgt.Formula = fx
-    Exit Sub
-
-TryFormulaArray:
-    Err.Clear
-    On Error GoTo FailHard
-    tgt.FormulaArray = fx
-    Exit Sub
-
-FailHard:
-    Err.Raise vbObjectError + 513, "SetCellFormulaCompat", "公式写入失败: " & Err.Description
-End Sub
-
-
-'=========================================================
-' 工具
-'=========================================================
-Private Function ParseLv(ByVal s As String) As Long
-    Dim t As String: t = Replace(Trim$(s), "级", "")
-    If IsNumeric(t) Then ParseLv = CLng(t) Else ParseLv = 0
-End Function
 
 
