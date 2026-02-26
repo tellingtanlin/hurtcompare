@@ -153,6 +153,7 @@ Public Sub Compare_NewModel_Run()
     ws.Calculate
 
 FIN:
+    Application.Calculation = xlCalculationAutomatic
     Application.EnableEvents = True
     Application.ScreenUpdating = True
 End Sub
@@ -277,7 +278,7 @@ End Function
 ' 逐步演算：写法B（defPerf/pProb不变）
 ' 唯一变化：穿透肉伤系数 pb = OPQ 分层查得（delta=pen-armorLv*10）
 '
-' 关键点：pb 用 Formula2 + MATCH(1,(delta>=O)*(delta<P),0) 精确命中，不要求 O 升序
+' 关键点：pb 用兼容写法 + MATCH(1,(delta>=O)*(delta<P),0) 精确命中，不要求 O 升序
 '=========================================================
 Private Sub FillIter_NewPB(ByVal ws As Worksheet, ByVal ds As Long, ByVal n As Long, ByVal gStart As Long, _
                            ByVal armorLv As Long, ByVal pen As Double, ByVal ad As Double, ByVal flesh As Double, _
@@ -344,13 +345,13 @@ Private Sub FillIter_NewPB(ByVal ws As Worksheet, ByVal ds As Long, ByVal n As L
         expF = "IF(" & prevA & "=0" & ls & flesh & ls & _
                "(" & pProb & ")*" & penF & "+(1-(" & pProb & "))*" & npF & ")"
 
-        ws.Cells(r, cDef).Formula2 = "=IFERROR(" & defPerf & ls & "0)"
-        ws.Cells(r, cP).Formula2 = "=IFERROR(" & pProb & ls & "0)"
-        ws.Cells(r, cExp).Formula2 = "=IFERROR(" & expF & ls & "0)"
+        SetCellFormulaCompat ws.Cells(r, cDef), "=IFERROR(" & defPerf & ls & "0)"
+        SetCellFormulaCompat ws.Cells(r, cP), "=IFERROR(" & pProb & ls & "0)"
+        SetCellFormulaCompat ws.Cells(r, cExp), "=IFERROR(" & expF & ls & "0)"
 
         '扣甲/扣血（保持旧：扣甲=甲伤；扣血=期望肉伤）
-        ws.Cells(r, cAR).Formula2 = "=IFERROR(MAX(0" & ls & prevA & "-" & ad & ")" & ls & "0)"
-        ws.Cells(r, cHP).Formula2 = "=IFERROR(MAX(0" & ls & prevH & "-(" & expF & "))" & ls & "0)"
+        SetCellFormulaCompat ws.Cells(r, cAR), "=IFERROR(MAX(0" & ls & prevA & "-" & ad & ")" & ls & "0)"
+        SetCellFormulaCompat ws.Cells(r, cHP), "=IFERROR(MAX(0" & ls & prevH & "-(" & expF & "))" & ls & "0)"
     Next i
 End Sub
 
@@ -683,8 +684,9 @@ Private Function DetectGunTable(ByVal ws As Worksheet, ByRef gunTable As Range, 
     Dim colLast As Long: colLast = cols("子弹型号")
 
     Dim lastRow As Long: lastRow = headerRow + 1
-    Do While Trim$(CStr(ws.Cells(lastRow, colName).Value)) <> "": lastRow = lastRow + 1: Loop
+    Do While lastRow <= ws.Rows.Count And Trim$(CStr(ws.Cells(lastRow, colName).Value)) <> "": lastRow = lastRow + 1: Loop
     lastRow = lastRow - 1
+    If lastRow <= headerRow Then DetectGunTable = False: Exit Function
 
     Set gunTable = ws.Range(ws.Cells(headerRow, colName), ws.Cells(lastRow, colLast))
     Set gunCols = cols
@@ -700,8 +702,9 @@ Private Function DetectBulletTable(ByVal ws As Worksheet, ByRef bulletTable As R
     Dim colLast As Long: colLast = cols("肉伤")
 
     Dim lastRow As Long: lastRow = headerRow + 1
-    Do While Trim$(CStr(ws.Cells(lastRow, colType).Value)) <> "": lastRow = lastRow + 1: Loop
+    Do While lastRow <= ws.Rows.Count And Trim$(CStr(ws.Cells(lastRow, colType).Value)) <> "": lastRow = lastRow + 1: Loop
     lastRow = lastRow - 1
+    If lastRow <= headerRow Then DetectBulletTable = False: Exit Function
 
     Set bulletTable = ws.Range(ws.Cells(headerRow, colType), ws.Cells(lastRow, colLast))
     Set bulletCols = cols
@@ -785,6 +788,29 @@ Private Function VTxt(ByVal key As String, ByVal tbl As Range, ByVal col As Long
 EH:
     VTxt = ""
 End Function
+
+
+
+Private Sub SetCellFormulaCompat(ByVal tgt As Range, ByVal fx As String)
+    On Error GoTo TryFormula
+    tgt.Formula2 = fx
+    Exit Sub
+
+TryFormula:
+    Err.Clear
+    On Error GoTo TryFormulaArray
+    tgt.Formula = fx
+    Exit Sub
+
+TryFormulaArray:
+    Err.Clear
+    On Error GoTo FailHard
+    tgt.FormulaArray = fx
+    Exit Sub
+
+FailHard:
+    Err.Raise vbObjectError + 513, "SetCellFormulaCompat", "公式写入失败: " & Err.Description
+End Sub
 
 
 '=========================================================
